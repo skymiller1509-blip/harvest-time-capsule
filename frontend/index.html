@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Harvest-Proof Time Capsule, QoreChain testnet</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 620px; margin: 40px auto; padding: 0 16px; line-height: 1.5; }
+  textarea { width: 100%; height: 110px; font-size: 1rem; padding: .5rem; box-sizing: border-box; }
+  input { font-size: 1rem; padding: .4rem; width: 100%; box-sizing: border-box; margin: 4px 0 10px; }
+  button { font-size: 1rem; padding: 10px 18px; margin: 4px 4px 4px 0; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #capsule { border: 2px solid #222; padding: 1rem; margin-top: 1.5rem; display: none; }
+  #countdown { font-size: 1.6rem; font-weight: bold; }
+  .muted { color: #666; font-size: 14px; }
+  code { background: #f0f0f0; padding: 2px 5px; border-radius: 4px; word-break: break-all; }
+  label { font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Harvest-Proof Time Capsule</h1>
+<p>Write a letter. Pick a date. Seal it with one hybrid-signed transaction on the QoreChain Diana testnet. It only opens on or after that date.</p>
+<p class="muted">Testnet only, sample text only. The chain stores only the SHA-256 hash of your letter, never the letter itself, so keep your letter safe until opening day. The seal is quantum-safe because the transaction carries both a classical signature and an ML-DSA-87 post-quantum signature. The date lock is enforced by the contract, not by encryption.</p>
+
+<!-- Paste the deployed TimeCapsule address here after `npm run deploy:capsule`. -->
+<p>Contract: <code id="contract">0xad9261bf5e318c34e3d51435288a354c8f60d2eb</code></p>
+
+<p><button id="connectBtn">1. Connect QoreX</button></p>
+<p id="status" class="muted">Connect QoreX first. Your account needs its ML-DSA-87 key registered and an EVM window open. QoreX does both. See CHECKLIST.md.</p>
+
+<h2>2. Write your letter</h2>
+<label for="title">Title</label>
+<input id="title" value="A letter to my future self">
+<label for="letter">Letter</label>
+<textarea id="letter" placeholder="Write your letter here..."></textarea>
+<p><button id="sampleBtn">Use the sample letter (opens in 5 minutes)</button></p>
+<label for="openDate">Open on or after</label>
+<input id="openDate" type="datetime-local">
+<p><button id="sealBtn" disabled>3. Seal it on chain</button></p>
+
+<div id="capsule">
+  <h2>Your sealed capsule</h2>
+  <p>Capsule id: <b id="capsuleId">-</b></p>
+  <p>Title: <b id="capsuleTitle">-</b></p>
+  <p>Opens: <b id="opensAt">-</b></p>
+  <p id="countdown">-</p>
+  <p class="muted">Letter hash on chain: <code id="letterHash">-</code></p>
+  <p class="muted">Seal tx: <code id="sealTx">-</code></p>
+  <p>
+    <button id="testBtn">Test the lock (free, no transaction)</button>
+    <button id="openBtn" disabled>4. Open it</button>
+  </p>
+  <p id="openResult"></p>
+</div>
+
+<h2>Load a capsule</h2>
+<p class="muted">Sealed one before? Enter its id to see its countdown.</p>
+<label for="loadId">Capsule id</label>
+<input id="loadId" type="number" min="0" value="0">
+<p><button id="loadBtn">Load capsule</button></p>
+
+<p class="muted">Demo tip: seal the sample letter, watch the countdown, tap "Test the lock" before the date to see the contract refuse, then open it after the date. The full loop is one seal transaction and one open transaction.</p>
+
+<script type="module">
+  // No build step, no dependencies. Reads use plain JSON-RPC against the
+  // public testnet endpoint. Writes go through window.ethereum (QoreX
+  // extension), so the wallet, not this page, signs the transaction.
+  const RPC = "https://evm-testnet.qore.host";
+  const CONTRACT = "0xad9261bf5e318c34e3d51435288a354c8f60d2eb"; // deployed 2026-11-13, Diana testnet
+  const SEAL_SELECTOR = "0x9559daab"; // sealCapsule(bytes32,uint256,string)
+  const OPEN_SELECTOR = "0x21e11f88"; // openCapsule(uint256,string)
+  const GET_SELECTOR = "0x3aac3858"; // getCapsule(uint256)
+  const TOTAL_SELECTOR = "0xb49ce17f"; // totalCapsules()
+  const SEALED_TOPIC = "0xdc8f866dea49b05f5a3261721a0099f0ad2408cf2b3ba77ef12db907315c6351";
+  const OPENED_TOPIC = "0x9732deaa32753dddfef197eb7e9bca50cac52f6645812242723ef5103d80dfc3";
+  const $ = (id) => document.getElementById(id);
+
+  const SAMPLE_LETTER = "Dear future me, this is a sample letter. It was sealed on the QoreChain testnet and it opens five minutes later. Nothing real is inside.";
+  const SAMPLE_TITLE = "Sample: hello future";
+
+  async function rpc(method, params) {
+    const r = await fetch(RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+    });
+    const j = await r.json();
+    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+    return j.result;
+  }
+
+  function hexPadUint(n) {
+    return BigInt(n).toString(16).padStart(64, "0");
+  }
+  function hexPadBytes32(hex) {
+    return hex.slice(2).padStart(64, "0");
+  }
+  function encodeString(str) {
+    const bytes = new TextEncoder().encode(str);
+    const len = hexPadUint(bytes.length);
+    let data = "";
+    bytes.forEach((b) => { data += b.toString(16).padStart(2, "0"); });
+    data = data.padEnd(Math.ceil(data.length / 64) * 64, "0");
+    return { len, data };
+  }
+  function encodeSeal(letterHashHex, unlockTime, title) {
+    const s = encodeString(title);
+    return SEAL_SELECTOR + hexPadBytes32(letterHashHex) + hexPadUint(unlockTime) + hexPadUint(96) + s.len + s.data;
+  }
+  function encodeOpen(id, letter) {
+    const s = encodeString(letter);
+    return OPEN_SELECTOR + hexPadUint(id) + hexPadUint(64) + s.len + s.data;
+  }
+  async function sha256Hex(text) {
+    if (!crypto.subtle) throw new Error("SHA-256 needs a secure page. Serve this file over localhost or https.");
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return "0x" + [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  // Decode getCapsule(uint256) return: (address, bytes32, uint256, bool, string).
+  // The first four words are fixed. The fifth word is the byte offset of the
+  // string data, which holds its length and then the title text.
+  function decodeCapsule(hex) {
+    const body = hex.slice(2);
+    const word = (i) => body.slice(i * 64, (i + 1) * 64);
+    const strOffset = parseInt(word(4), 16);
+    const strLen = parseInt(body.slice(strOffset * 2, strOffset * 2 + 64), 16);
+    const strHex = body.slice(strOffset * 2 + 64, strOffset * 2 + 64 + strLen * 2);
+    const bytes = new Uint8Array(strHex.match(/../g).map((h) => parseInt(h, 16)));
+    return {
+      creator: "0x" + word(0).slice(24),
+      letterHash: "0x" + word(1),
+      unlockTime: parseInt(word(2), 16),
+      opened: parseInt(word(3), 16) !== 0,
+      title: new TextDecoder().decode(bytes),
+    };
+  }
+  function fmtTime(unix) {
+    return new Date(unix * 1000).toLocaleString();
+  }
+  function fmtCountdown(unlockTime) {
+    const left = unlockTime - Math.floor(Date.now() / 1000);
+    if (left <= 0) return "Ready to open.";
+    const d = Math.floor(left / 86400);
+    const h = Math.floor((left % 86400) / 3600);
+    const m = Math.floor((left % 3600) / 60);
+    const s = left % 60;
+    return d > 0 ? `${d}d ${h}h ${m}m ${s}s left` : `${h}h ${m}m ${s}s left`;
+  }
+
+  let account = null;
+  let capsule = null; // { id, unlockTime, opened, title, letterHash }
+  let timer = null;
+
+  function showCapsule(c) {
+    capsule = c;
+    $("capsule").style.display = "block";
+    $("capsuleId").textContent = c.id;
+    $("capsuleTitle").textContent = c.title;
+    $("opensAt").textContent = fmtTime(c.unlockTime);
+    $("letterHash").textContent = c.letterHash;
+    if (timer) clearInterval(timer);
+    const tick = () => {
+      $("countdown").textContent = c.opened ? "Opened." : fmtCountdown(c.unlockTime);
+      $("openBtn").disabled = c.opened || Math.floor(Date.now() / 1000) < c.unlockTime;
+    };
+    tick();
+    timer = setInterval(tick, 1000);
+  }
+
+  async function loadCapsule(id) {
+    if (CONTRACT.startsWith("0x0000")) { $("status").textContent = "Contract not deployed yet."; return; }
+    const raw = await rpc("eth_call", [{ to: CONTRACT, data: GET_SELECTOR + hexPadUint(id) }, "latest"]);
+    const c = decodeCapsule(raw);
+    showCapsule({ id, ...c });
+  }
+
+  $("connectBtn").onclick = async () => {
+    if (!window.ethereum) { $("status").textContent = "No wallet found. Install the QoreX browser extension first."; return; }
+    try {
+      await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x2648" }] });
+      const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+      account = accounts[0];
+      $("status").textContent = "Connected: " + account;
+      $("sealBtn").disabled = false;
+    } catch (e) { $("status").textContent = "Connect failed: " + (e.message || e); }
+  };
+
+  $("sampleBtn").onclick = () => {
+    $("title").value = SAMPLE_TITLE;
+    $("letter").value = SAMPLE_LETTER;
+    const d = new Date(Date.now() + 5 * 60 * 1000);
+    d.setSeconds(0, 0);
+    $("openDate").value = d.toISOString().slice(0, 16);
+    $("status").textContent = "Sample letter loaded. It opens in 5 minutes.";
+  };
+
+  $("sealBtn").onclick = async () => {
+    if (!account || CONTRACT.startsWith("0x0000")) return;
+    const letter = $("letter").value.trim();
+    const title = $("title").value.trim() || "Untitled capsule";
+    const dateVal = $("openDate").value;
+    if (!letter) { $("status").textContent = "Write your letter first."; return; }
+    if (!dateVal) { $("status").textContent = "Pick an open date first."; return; }
+    const unlockTime = Math.floor(new Date(dateVal).getTime() / 1000);
+    if (unlockTime * 1000 <= Date.now()) { $("status").textContent = "Pick a date in the future."; return; }
+    $("status").textContent = "Sealing… approve it in QoreX.";
+    try {
+      const letterHash = await sha256Hex(letter);
+      const data = encodeSeal(letterHash, unlockTime, title);
+      const hash = await window.ethereum.request({
+        method: "eth_sendTransaction",
+        params: [{ from: account, to: CONTRACT, data }],
+      });
+      $("sealTx").textContent = hash;
+      $("status").textContent = "Seal sent. Waiting for it to land…";
+      let id = null;
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const receipt = await rpc("eth_getTransactionReceipt", [hash]);
+        if (receipt) {
+          const log = (receipt.logs || []).find((l) => l.topics && l.topics[0] === SEALED_TOPIC);
+          if (log && log.topics[1]) id = parseInt(log.topics[1], 16);
+          break;
+        }
+      }
+      if (id === null) {
+        const total = await rpc("eth_call", [{ to: CONTRACT, data: TOTAL_SELECTOR }, "latest"]);
+        id = parseInt(total, 16) - 1;
+      }
+      $("status").textContent = "Sealed. Keep your letter safe until opening day.";
+      showCapsule({ id, unlockTime, opened: false, title, letterHash });
+    } catch (e) { $("status").textContent = "Seal failed: " + (e.message || e); }
+  };
+
+  $("testBtn").onclick = async () => {
+    if (!account || !capsule) return;
+    const letter = $("letter").value.trim();
+    if (!letter) { $("openResult").textContent = "Paste the same letter text first, so the check can hash it."; return; }
+    $("openResult").textContent = "Checking the lock (free, no transaction)…";
+    try {
+      const data = encodeOpen(capsule.id, letter);
+      await rpc("eth_call", [{ from: account, to: CONTRACT, data }, "latest"]);
+      $("openResult").textContent = "The lock would open. The date has passed and the letter matches.";
+    } catch (e) {
+      $("openResult").textContent = "The lock holds: " + (e.message || e);
+    }
+  };
+
+  $("openBtn").onclick = async () => {
+    if (!account || !capsule) return;
+    const letter = $("letter").value.trim();
+    if (!letter) { $("openResult").textContent = "Paste the same letter text first."; return; }
+    $("openResult").textContent = "Opening… approve it in QoreX.";
+    try {
+      const hash = await window.ethereum.request({
+        method: "eth_sendTransaction",
+        params: [{ from: account, to: CONTRACT, data: encodeOpen(capsule.id, letter) }],
+      });
+      $("openResult").textContent = "Open sent (" + hash + "). Waiting…";
+      for (let i = 0; i < 30; i++) {
+        await new Promise((r) => setTimeout(r, 2000));
+        const receipt = await rpc("eth_getTransactionReceipt", [hash]);
+        if (receipt) {
+          const log = (receipt.logs || []).find((l) => l.topics && l.topics[0] === OPENED_TOPIC);
+          $("openResult").textContent = log
+            ? "Opened! Your letter: " + letter
+            : "Open landed, but the Opened event was not found. Check the explorer.";
+          capsule.opened = true;
+          showCapsule(capsule);
+          return;
+        }
+      }
+      $("openResult").textContent = "Still waiting. Check the tx on explore.qore.network (Testnet).";
+    } catch (e) { $("openResult").textContent = "Open failed: " + (e.message || e); }
+  };
+
+  $("loadBtn").onclick = async () => {
+    try {
+      await loadCapsule(parseInt($("loadId").value, 10) || 0);
+      $("status").textContent = "";
+    } catch (e) { $("status").textContent = "Could not load that capsule: " + (e.message || e); }
+  };
+</script>
+</body>
+</html>
